@@ -1,0 +1,53 @@
+# --- secrets: never commit these -------------------------------------------
+# gity export files contain your private SSH keys (encrypted, but still)
+*.gity
+# a gity home accidentally created inside the repo (GITY_HOME=./.gity)
+.gity/
+# private keys and credentials of any kind
+*_key
+*_key.pub
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.pem
+*.p12
+.env
+.env.*
+!.env.example
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# test / lint / type-check caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# --- editors / OS ----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

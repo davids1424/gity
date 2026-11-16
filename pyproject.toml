@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gity"
+version = "0.3.0"
+description = "Git wrapper with multi-account SSH profile management — every git command and flag, plus profiles."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["cryptography>=42.0"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "David" }]
+keywords = ["git", "ssh", "profiles", "multi-account", "github", "gitlab"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/davids1424/gity"
+Issues = "https://github.com/davids1424/gity/issues"
+
+[project.scripts]
+gity = "gity.cli:main"
+
+[tool.setuptools]
+packages = ["gity"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
