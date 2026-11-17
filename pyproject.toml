@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gity"
-version = "0.3.0"
+version = "0.4.0"
 description = "Git wrapper with multi-account SSH profile management — every git command and flag, plus profiles."
 readme = "README.md"
 requires-python = ">=3.9"

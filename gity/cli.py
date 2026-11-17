@@ -11,6 +11,9 @@ Usage:
     gity profile --remove NAME      delete a profile and its keys (asks first; -y to skip)
     gity profile --delete NAME      delete a profile and its keys (no prompt)
     gity profile --setauto [on|off] auto-detect the right profile when cloning
+    gity profile --setpassword [NAME]
+                                    password-protect a profile's SSH key
+    gity profile --lock             re-lock unlocked protected keys immediately
 
     gity --export FILE              encrypted backup of profiles + keys
     gity --import FILE              restore a backup on this machine
@@ -34,7 +37,7 @@ from pathlib import Path
 from . import __version__
 from . import crypto as C
 from . import profiles as P
-from .ssh_env import run_git_with_profile, ssh_command_for
+from .ssh_env import have_terminal, run_git_with_profile, ssh_command_for
 from .util import is_ssh_url, ssh_target, url_to_repo_name
 
 # git's own options that sit before the subcommand and take a separate value
@@ -220,6 +223,12 @@ def cmd_profile(args: list[str]) -> int:
     ap.add_argument("--setauto", nargs="?", const="toggle", metavar="ON|OFF",
                     help="toggle auto-detect for clones: probe every profile key and bind "
                          "the first one that can read the repo being cloned")
+    ap.add_argument("--setpassword", nargs="?", const="__select__", metavar="NAME",
+                    help="encrypt a profile's SSH key with a password; every push, pull, "
+                         "fetch or clone with it then asks for that password "
+                         "(run again to change the password)")
+    ap.add_argument("--lock", action="store_true",
+                    help="forget every unlocked password-protected key right now")
     ap.add_argument("-y", "--yes", action="store_true", help="skip the --remove confirmation")
     ap.add_argument("--email", help="git commit email for this profile")
     ap.add_argument("--name", help="git commit name for this profile")
@@ -332,6 +341,15 @@ def cmd_profile(args: list[str]) -> int:
             print("  the first key that can read the repo is bound to the cloned directory")
         return 0
 
+    if ns.lock:
+        from .unlock import lock_all
+        lock_all()
+        print("gity: all password-protected profiles are locked again")
+        return 0
+
+    if ns.setpassword is not None:
+        return cmd_setpassword(cfg, None if ns.setpassword == "__select__" else ns.setpassword)
+
     if ns.delete:
         try:
             P.delete_profile(cfg, ns.delete)
@@ -345,20 +363,109 @@ def cmd_profile(args: list[str]) -> int:
     if not profs:
         print("no profiles yet — create one with: gity profile -i")
         return 0
-    print(f"{'PROFILE':<20} {'TYPE':<9} {'CREATED':<20} {'DEFAULT':<8} KEY")
+    print(f"{'PROFILE':<20} {'TYPE':<9} {'CREATED':<20} {'DEFAULT':<8} {'PASSWORD':<9} KEY")
     for n, meta in profs.items():
         if not isinstance(meta, dict):
             continue
         star = n == cfg.get("default_profile")
+        locked = P.key_is_encrypted(meta.get("key_path"))
         print(f"{n + ('*' if star else ''):<20} {str(meta.get('key_type') or '?'):<9} "
               f"{str(meta.get('created_at') or '')[:19]:<20} "
-              f"{'yes' if star else '':<8} {meta.get('key_path') or ''}")
+              f"{'yes' if star else '':<8} {'yes' if locked else '':<9} "
+              f"{meta.get('key_path') or ''}")
     repos = cfg.get("repos", {})
     if repos:
         print("\nrepo assignments:")
         for r, p in sorted(repos.items()):
             print(f"  {str(p):<15} {r}")
     print(f"\nauto-detect on clone: {'on' if cfg.get('auto_detect') else 'off'}")
+    return 0
+
+
+_PASSWORD_WARNING = """\
+  WARNING — read before continuing:
+  * The password encrypts the private key file itself. There is NO reset:
+    forget it and this profile's key is gone for good. You would have to
+    create a new profile and register its public key with your git host.
+  * Every command that talks to the remote over SSH with this profile
+    (push, pull, fetch, clone, ls-remote, ...) will ask for the password on
+    your terminal. Scripts and agents without a terminal can't use it.
+  * After you enter it, the key stays unlocked for 60 seconds in THIS
+    terminal only (so `gity pull && gity push` asks once). It is never put
+    in your normal ssh-agent or the macOS Keychain. `gity profile --lock`
+    forgets it immediately.
+  * This protects the key file at rest. It does not protect a password you
+    type into a terminal an agent can read, other unprotected profiles, or
+    your normal ~/.ssh keys. For full isolation run agents as a separate
+    OS user.
+  * Exports (gity --export) keep the key encrypted with this password."""
+
+
+def _select_profile(cfg: dict) -> str:
+    """Interactive picker: numbered list of profiles, answer with number or name."""
+    names = [n for n, m in P.list_profiles(cfg).items() if isinstance(m, dict)]
+    if not names:
+        die("no profiles yet — create one with: gity profile -i")
+    print("Which profile should be password-protected?")
+    for i, n in enumerate(names, 1):
+        meta = P.get_profile(cfg, n) or {}
+        tags = []
+        if n == cfg.get("default_profile"):
+            tags.append("default")
+        if P.key_is_encrypted(meta.get("key_path")):
+            tags.append("has password")
+        ident = meta.get("email") or ""
+        print(f"  {i}) {n:<20} {ident:<30} {', '.join(tags)}")
+    answer = prompt("Profile number or name", "").strip()
+    if answer.isdigit() and 1 <= int(answer) <= len(names):
+        return names[int(answer) - 1]
+    if answer in names:
+        return answer
+    die(f"no such profile: {answer}" if answer else "no profile selected")
+
+
+def cmd_setpassword(cfg: dict, name: str | None) -> int:
+    # Interactive by design: the password must come from a human at a
+    # terminal, never from argv, a pipe or an environment variable.
+    if not (sys.stdin.isatty() and have_terminal()):
+        die("--setpassword needs an interactive terminal")
+    if name is None:
+        name = _select_profile(cfg)
+    meta = P.get_profile(cfg, name)
+    if meta is None:
+        die(f"no such profile: {name}")
+    key_path = meta.get("key_path")
+    if not key_path or not Path(key_path).expanduser().is_file():
+        die(f"profile '{name}' has no key file at {key_path}")
+    already = P.key_is_encrypted(key_path)
+    print()
+    print(f"gity: {'changing the password of' if already else 'setting a password on'} "
+          f"profile '{name}'")
+    print(f"  key: {key_path}")
+    print(_PASSWORD_WARNING)
+    if already:
+        print("  (you'll be asked for the current password first; leave the new one "
+              "empty to remove protection)")
+    print()
+    if prompt("Continue? (y/N)", "n").lower() not in ("y", "yes"):
+        print("gity: aborted")
+        return 1
+    try:
+        rc = P.set_key_password(key_path)
+    except (OSError, RuntimeError) as e:
+        die(str(e))
+    locked = P.key_is_encrypted(key_path)
+    if rc != 0:
+        print(f"gity: ssh-keygen failed (rc={rc}); profile '{name}' is "
+              f"{'still password-protected' if locked else 'NOT password-protected'}",
+              file=sys.stderr)
+        return rc or 1
+    if locked:
+        print(f"gity: profile '{name}' is password-protected — its key is encrypted on disk")
+        print("  pushes, pulls and fetches with it will ask for the password")
+    else:
+        print(f"gity: warning: profile '{name}' has NO password — its key is stored unencrypted",
+              file=sys.stderr)
     return 0
 
 
@@ -572,11 +679,18 @@ def auto_detect_profile(cfg: dict, git_args: list[str]) -> str | None:
     dest = _probe_destination(url) if is_ssh_url(url) else None
     if not dest:
         return None
-    candidates = []
+    candidates, locked = [], []
     for name, meta in cfg.get("profiles", {}).items():
         key_path = meta.get("key_path") if isinstance(meta, dict) else None
         if key_path and Path(key_path).expanduser().exists():
-            candidates.append((name, key_path))
+            # probing must not prompt, so password-protected keys sit it out
+            if P.key_is_encrypted(key_path):
+                locked.append(name)
+            else:
+                candidates.append((name, key_path))
+    if locked:
+        print(f"gity: auto-detect: skipping password-protected profile(s): {', '.join(locked)} "
+              "(clone with -p NAME to use one)")
     if not candidates:
         return None
     # Cheap host-level auth first to skip dead keys, then verify the key can

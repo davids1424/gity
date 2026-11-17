@@ -5,6 +5,8 @@ Run with:  python3 -m pytest tests/ -v   (or python3 -m unittest discover tests)
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -931,6 +933,149 @@ class TestRegressions(GityTestBase):
         self.assertTrue(blob.startswith(b"GITY1"))
         self.assertNotIn(b"OPENSSH PRIVATE KEY", blob)
         self.assertIn("work", json.loads(C.decrypt_bytes("pw", blob))["config"]["profiles"])
+
+
+def _encrypt_key(path, password):
+    """Test-only: put a password on a key non-interactively."""
+    subprocess.run(["ssh-keygen", "-q", "-p", "-P", "", "-N", password, "-f", str(path)],
+                   check=True, capture_output=True)
+
+
+class TestPasswordProtection(GityTestBase):
+    def _profile(self, name="agent"):
+        return P.add_profile(P.load(), name, comment="c", email="a@example.com", key_bits=2048)
+
+    def test_detects_encryption_from_the_key_file(self):
+        key = self._profile()
+        self.assertFalse(P.key_is_encrypted(key))
+        _encrypt_key(key, "s3cret-pass")
+        self.assertTrue(P.key_is_encrypted(key))
+        self.assertNotIn(b"s3cret", key.read_bytes())
+        self.assertFalse(P.key_is_encrypted(None))
+        self.assertFalse(P.key_is_encrypted(self.home / "missing"))
+
+    def test_plain_key_keeps_batch_mode(self):
+        from gity.ssh_env import ssh_command_for
+        key = self._profile()
+        cmd = ssh_command_for(str(key))
+        self.assertIn("BatchMode=yes", cmd)
+        self.assertNotIn("ssh_helper", cmd)
+
+    def test_protected_key_routes_through_helper(self):
+        from gity.ssh_env import ssh_command_for, protected_ssh_argv
+        key = self._profile()
+        _encrypt_key(key, "pw-123456")
+        cmd = ssh_command_for(str(key))
+        self.assertIn("gity.ssh_helper", cmd)
+        self.assertNotIn("BatchMode", cmd)
+        argv = protected_ssh_argv(str(key))
+        joined = " ".join(argv)
+        for opt in ("IdentityAgent=none", "AddKeysToAgent=no", "UseKeychain=no",
+                    "IdentitiesOnly=yes", "PasswordAuthentication=no"):
+            self.assertIn(opt, joined)
+        self.assertIn("IdentityAgent=/x/%%d/s",
+                      " ".join(protected_ssh_argv(str(key), agent_sock="/x/%d/s")))
+
+    def test_no_terminal_means_no_unlock(self):
+        from unittest import mock
+        from gity import unlock
+        key = self._profile()
+        _encrypt_key(key, "pw-123456")
+        with mock.patch.object(unlock, "have_terminal", return_value=False):
+            self.assertIsNone(unlock.unlocked_agent(str(key)))
+        self.assertFalse((self.home / "run").exists())
+
+    def test_auto_detect_skips_protected_profiles(self):
+        from unittest import mock
+        from gity import cli
+        import contextlib, io
+        _encrypt_key(self._profile("locked"), "pw-123456")
+        self._profile("open")
+        tried = []
+        with mock.patch.object(cli, "probe_key_auth", side_effect=lambda d, k: tried.append(k) or True), \
+             mock.patch.object(cli, "probe_repo_access", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                got = cli.auto_detect_profile(P.load(), ["clone", "git@github.com:u/r.git"])
+        self.assertEqual(got, "open")
+        self.assertTrue(all("locked_key" not in k for k in tried))
+        self.assertIn("skipping password-protected profile(s): locked", out.getvalue())
+
+    def test_setpassword_refuses_without_terminal(self):
+        from gity.cli import cmd_profile
+        import contextlib, io
+        self._profile()
+        old = sys.stdin
+        sys.stdin = io.StringIO("")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit):
+                    cmd_profile(["--setpassword", "agent"])
+        finally:
+            sys.stdin = old
+        self.assertIn("interactive terminal", err.getvalue())
+        self.assertFalse(P.key_is_encrypted(P.keys_dir() / "agent_key"))
+
+    def test_list_shows_password_column(self):
+        from gity.cli import cmd_profile
+        import contextlib, io
+        _encrypt_key(self._profile("locked"), "pw-123456")
+        self._profile("open")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cmd_profile(["-l"])
+        lines = out.getvalue().splitlines()
+        self.assertIn("PASSWORD", lines[0])
+        locked = next(l for l in lines if l.startswith("locked"))
+        opened = next(l for l in lines if l.startswith("open"))
+        self.assertIn(" yes ", locked)
+        self.assertNotIn(" yes ", opened)
+
+    def test_export_keeps_protected_key_encrypted(self):
+        import base64
+        key = self._profile()
+        _encrypt_key(key, "pw-123456")
+        payload = P.export_payload(P.load())
+        self.assertEqual(base64.b64decode(payload["files"]["agent_key"]), key.read_bytes())
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("ssh-agent"), "needs a pty + ssh-agent")
+    def test_chained_commands_ask_for_the_password_once(self):
+        """`a && b` in one terminal: the second process reuses the unlock."""
+        import pty, select, time
+        from gity import unlock
+        key = self._profile()
+        _encrypt_key(key, "pw-123456")
+        root = str(Path(__file__).resolve().parents[1])
+        probe = ("import sys; sys.path.insert(0, %r); from gity.unlock import unlocked_agent; "
+                 "print('SOCK' if unlocked_agent(%r) else 'NOSOCK')") % (root, str(key))
+        script = (f'{shlex.quote(sys.executable)} -c {shlex.quote(probe)} && '
+                  f'{shlex.quote(sys.executable)} -c {shlex.quote(probe)}')
+        env = dict(os.environ, GITY_HOME=str(self.home), GITY_UNLOCK_SECONDS="20")
+        pid, fd = pty.fork()
+        if pid == 0:  # child: new session with this pty as its terminal
+            os.execvpe("/bin/sh", ["/bin/sh", "-c", script], env)
+        out, prompts, deadline = b"", 0, time.time() + 30
+        try:
+            while time.time() < deadline:
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(fd, 1024)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if out.count(b"passphrase") > prompts:
+                    prompts += 1
+                    os.write(fd, b"pw-123456\n")
+        finally:
+            os.waitpid(pid, 0)
+            unlock.lock_all()
+        text = out.decode(errors="replace")
+        self.assertEqual(prompts, 1, text)
+        self.assertEqual(text.count("NOSOCK"), 0, text)
+        self.assertEqual(text.count("SOCK"), 2, text)
+        self.assertFalse((self.home / "run").exists() and any((self.home / "run").iterdir()))
 
 
 if __name__ == "__main__":

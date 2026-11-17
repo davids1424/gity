@@ -196,6 +196,60 @@ def add_profile(cfg: dict, name: str, comment: str, email: str | None,
     return key_path
 
 
+# ---------------------------------------------------- password protection --
+
+_OPENSSH_MAGIC = b"openssh-key-v1\0"
+
+
+def key_is_encrypted(key_path: str | os.PathLike | None) -> bool:
+    """True when the private key file on disk is passphrase-encrypted.
+
+    This reads the key file itself rather than a flag in config.json, so the
+    answer can't be faked by editing the config: the file is either
+    ciphertext or it isn't.
+    """
+    if not key_path:
+        return False
+    try:
+        text = Path(key_path).expanduser().read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    if "BEGIN OPENSSH PRIVATE KEY" in text:
+        body = "".join(line.strip() for line in text.splitlines()
+                       if line.strip() and not line.startswith("-----"))
+        try:
+            raw = base64.b64decode(body)
+        except (binascii.Error, ValueError):
+            return False
+        if not raw.startswith(_OPENSSH_MAGIC):
+            return False
+        off = len(_OPENSSH_MAGIC)
+        n = int.from_bytes(raw[off:off + 4], "big")
+        cipher = raw[off + 4:off + 4 + n]
+        return cipher not in (b"", b"none")
+    # legacy PEM formats
+    return "ENCRYPTED" in text
+
+
+def set_key_password(key_path: str | os.PathLike, rounds: int = 100) -> int:
+    """Set or change the passphrase of a private key in place.
+
+    ssh-keygen runs interactively on the user's terminal so the password is
+    typed straight into it and never passes through gity, argv or the
+    environment. Returns ssh-keygen's exit code.
+    """
+    key = Path(key_path).expanduser()
+    if not key.is_file():
+        raise FileNotFoundError(f"SSH key not found: {key}")
+    try:
+        rc = subprocess.run(["ssh-keygen", "-p", "-a", str(rounds), "-f", str(key)]).returncode
+    except FileNotFoundError:
+        raise RuntimeError("ssh-keygen not found on PATH (install OpenSSH)") from None
+    if key.exists() and os.name != "nt":
+        os.chmod(key, 0o600)
+    return rc
+
+
 def _inside_keys_dir(path: Path) -> bool:
     try:
         path.resolve().relative_to(keys_dir().resolve())

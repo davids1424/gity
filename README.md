@@ -119,6 +119,28 @@ After a successful clone (or `gity profile -a NAME`), the directory is recorded 
 
 `gity init` and `gity worktree add` bind the new directory to whichever profile was in effect when you ran them.
 
+### Password-protected profiles (keeping agents out)
+
+Running AI agents or scripts under their own profile is a good way to keep their commits under a separate identity. The catch: any process running as you can read an unprotected key in `~/.gity/keys/` and push as that account. Put a password on the profiles you want to keep for yourself:
+
+```bash
+gity profile --setpassword          # pick the profile from a list
+gity profile --setpassword personal # or name it
+```
+
+gity shows a warning, then hands you to `ssh-keygen`, which encrypts the private key file with your password. The password goes straight into `ssh-keygen` on your terminal and never passes through gity, the command line or the environment. Run the same command again to change the password; leaving the new one empty removes it.
+
+From then on:
+
+- Anything that talks to the remote with that profile (`push`, `pull`, `fetch`, `clone`, …) asks for the password. Local commands like `status`, `commit` and `log` never ask.
+- Once you type it, the key stays unlocked for **60 seconds in that terminal only**, so `gity pull && gity push` asks once. `GITY_UNLOCK_SECONDS` changes the window; `gity profile --lock` forgets it straight away.
+- The unlocked key lives only in a private, self-expiring `ssh-agent` that belongs to your terminal session. It never goes into your normal ssh-agent or the macOS Keychain, and gity never writes it to disk decrypted.
+- A process with no terminal, such as an agent's shell, gets no prompt and no unlocked key, so the command fails with a clear message.
+- Auto-detect skips protected profiles, because it can't stop to ask for their passwords. Clone with `-p NAME` to use one.
+- `gity profile -l` shows which profiles have a password. Exports keep these keys encrypted with that password.
+
+Lose the password and the key can't be recovered. Create a new profile and register its public key instead.
+
 ### Everything else is just git
 
 ```bash
@@ -142,6 +164,8 @@ One deliberate difference: when a profile key is in use, SSH runs non-interactiv
 | `gity profile -a NAME` | Bind the repo you're standing in to a profile and set its commit identity |
 | `gity profile -d NAME` | Set the default profile |
 | `gity profile --setauto [on\|off]` | Turn auto-detect on or off (no value toggles it) |
+| `gity profile --setpassword [NAME]` | Encrypt a profile's SSH key with a password (asks which profile when `NAME` is omitted). Run again to change it |
+| `gity profile --lock` | Lock every unlocked password-protected key immediately |
 | `gity profile --remove NAME` | Delete a profile and its keys, after confirmation (`-y` skips the prompt) |
 | `gity profile --delete NAME` | Delete a profile and its keys without asking |
 | `gity --export FILE` | Write an encrypted backup of all profiles and keys |
@@ -163,6 +187,7 @@ Environment:
 | Variable | Meaning |
 | --- | --- |
 | `GITY_HOME` | Where profiles and keys are stored (default `~/.gity`) |
+| `GITY_UNLOCK_SECONDS` | How long a password-protected key stays unlocked in a terminal (default `60`, max `3600`) |
 
 ## Moving between machines
 
@@ -224,6 +249,8 @@ gity/
   cli.py        argument routing, `gity profile`, clone auto-detect, export/import commands
   profiles.py   profile storage, repo bindings, export/import payloads
   ssh_env.py    runs git with GIT_SSH_COMMAND bound to a profile key
+  ssh_helper.py GIT_SSH_COMMAND for password-protected keys
+  unlock.py     per-terminal, self-expiring unlock cache for protected keys
   crypto.py     passphrase encryption for export files
   util.py       git URL parsing
 tests/
@@ -232,7 +259,8 @@ tests/
 
 ## Security notes
 
-- Profile keys are generated **without a passphrase** so git can use them unattended. They are protected by file permissions (`0600`, inside `~/.gity/keys/`), so treat that directory like `~/.ssh`.
+- Profile keys are generated **without a passphrase** so git can use them unattended. They are protected by file permissions (`0600`, inside `~/.gity/keys/`), so treat that directory like `~/.ssh`. Use `gity profile --setpassword` on any profile that other processes running as you, such as AI agents, shouldn't be able to use.
+- A password-protected key is encrypted at rest. That stops other processes from using it just by reading the file. It does **not** stop malicious code running as your own OS user, which could capture the password as you type it or connect to the unlock agent during its 60-second window. For strict separation, run agents as a different OS user.
 - `*.gity` export files contain your private keys. They are encrypted, but only as strong as the passphrase you choose. Don't commit them — the bundled `.gitignore` excludes them.
 - Import only export files you trust. gity validates what it unpacks and writes only key files into its own keys directory, but an import still adds SSH identities to your machine.
 - Deleting a profile removes only key files inside gity's keys directory.
